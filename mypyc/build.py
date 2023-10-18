@@ -21,11 +21,13 @@ hackily decide based on whether setuptools has been imported already.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import os.path
 import re
 import sys
 import time
-from typing import TYPE_CHECKING, Any, Dict, Iterable, NoReturn, Union, cast
+from tempfile import NamedTemporaryFile
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, NoReturn, TypeVar, cast
 
 from mypy.build import BuildSource
 from mypy.errors import CompileError
@@ -41,48 +43,60 @@ from mypyc.namegen import exported_name
 from mypyc.options import CompilerOptions
 
 if sys.version_info < (3, 12):
-    if TYPE_CHECKING:
-        from distutils.core import Extension as _distutils_Extension
-        from typing_extensions import TypeAlias
-
-        from setuptools import Extension as _setuptools_Extension
-
-        Extension: TypeAlias = Union[_setuptools_Extension, _distutils_Extension]
-
     try:
         # Import setuptools so that it monkey-patch overrides distutils
         import setuptools
     except ImportError:
         pass
+
     from distutils import ccompiler, sysconfig
+    from distutils.core import Extension
+    from distutils.command.build_ext import build_ext as BuildExt
 else:
     import setuptools
     from setuptools import Extension
-    from setuptools._distutils import (
-        ccompiler as _ccompiler,  # type: ignore[attr-defined]
-        sysconfig as _sysconfig,  # type: ignore[attr-defined]
-    )
+    from setuptools.command.build_ext import build_ext as BuildExt
 
-    ccompiler = _ccompiler
-    sysconfig = _sysconfig
+    if TYPE_CHECKING:
+        # Do not import setuptools._distutils directly as it can cause
+        # runtime problems (e.g.: pypa/setuptools#3743).
+        from setuptools._distutils import (
+            ccompiler as _ccompiler,  # type: ignore[attr-defined]
+            sysconfig as _sysconfig,  # type: ignore[attr-defined]
+        )
+
+        ccompiler = _ccompiler
+        sysconfig = _sysconfig
+    else:
+        # The only supported way of importing distutils in Python 3.12+
+        # is via setuptools' MetaPathFinder.
+        from distutils import ccompiler, sysconfig
+
+_PREPROCESSING_SUPPORTED: bool = False
+
+if TYPE_CHECKING:
+    _base_Extension = Extension
+else:
+    try:
+        from setuptools.extension import PreprocessedExtension  # type: ignore[import]
+        _PREPROCESSING_SUPPORTED = True
+        _base_Extension = PreprocessedExtension
+    except ImportError:
+        _base_Extension = Extension
 
 
 def get_extension() -> type[Extension]:
     # We can work with either setuptools or distutils, and pick setuptools
     # if it has been imported.
     use_setuptools = "setuptools" in sys.modules
-    extension_class: type[Extension]
 
     if sys.version_info < (3, 12) and not use_setuptools:
         import distutils.core
 
-        extension_class = distutils.core.Extension
-    else:
-        if not use_setuptools:
-            sys.exit("error: setuptools not installed")
-        extension_class = setuptools.Extension
-
-    return extension_class
+        return distutils.core.Extension
+    if not use_setuptools:
+        sys.exit("error: setuptools not installed")
+    return setuptools.Extension
 
 
 def setup_mypycify_vars() -> None:
@@ -332,16 +346,21 @@ def write_file(path: str, contents: str) -> None:
     except OSError:
         old_contents = None
     if old_contents != encoded_contents:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "wb") as g:
+        parent = os.path.dirname(path)
+        os.makedirs(parent, exist_ok=True)
+
+        # Use a temporary file and then os.replace for atomicity in parallel builds
+        with NamedTemporaryFile("wb", dir=parent, delete=False) as g:
+            temp = g.name
             g.write(encoded_contents)
 
         # Fudge the mtime forward because otherwise when two builds happen close
         # together (like in a test) setuptools might not realize the source is newer
         # than the new artifact.
         # XXX: This is bad though.
-        new_mtime = os.stat(path).st_mtime + 1
-        os.utime(path, times=(new_mtime, new_mtime))
+        new_mtime = os.stat(temp).st_mtime + 1
+        os.utime(temp, times=(new_mtime, new_mtime))
+        os.replace(temp, path)
 
 
 def construct_groups(
@@ -453,7 +472,7 @@ def mypyc_build(
     return groups, group_cfilenames
 
 
-def mypycify(
+def _mypycify_orig(
     paths: list[str],
     *,
     only_compile_paths: Iterable[str] | None = None,
@@ -610,3 +629,279 @@ def mypycify(
             )
 
     return extensions
+
+
+def mypycify(
+    paths: list[str],
+    *,
+    only_compile_paths: Iterable[str] | None = None,
+    verbose: bool = False,
+    opt_level: str = "3",
+    debug_level: str = "1",
+    strip_asserts: bool = False,
+    multi_file: bool = False,
+    separate: bool | list[tuple[list[str], str | None]] = False,
+    skip_cgen_input: Any | None = None,
+    target_dir: str | None = None,
+    include_runtime_files: bool | None = None,
+) -> list[Extension]:
+    # Figure out our configuration
+    compiler_options = CompilerOptions(
+        strip_asserts=strip_asserts,
+        multi_file=multi_file,
+        verbose=verbose,
+        separate=separate is not False,
+        target_dir=target_dir,
+        include_runtime_files=include_runtime_files,
+    )
+
+    # Consider config file
+    fscache = FileSystemCache()
+    mypyc_sources, _all_sources, options = get_mypy_config(
+        paths, only_compile_paths, compiler_options, fscache
+    )
+
+    # We generate a shared lib if there are multiple modules or if any
+    # of the modules are in package. (Because I didn't want to fuss
+    # around with making the single module code handle packages.)
+    use_shared_lib = (
+        len(mypyc_sources) > 1
+        or any("." in x.module for x in mypyc_sources)
+    )
+
+    groups = construct_groups(mypyc_sources, separate, use_shared_lib)
+    cflags = _customize_compiler(opt_level, debug_level, multi_file)
+    pregen_files = _separate_skip_cgen_groups(skip_cgen_input)
+
+    extensions: list[Extension] = []
+    for (group, skip_cgen_group) in zip(groups, pregen_files):
+        extensions.append(
+            _MypycExtension(
+                group,
+                options,
+                compiler_options,
+                fscache,
+                cflags,
+                skip_cgen_group,
+            )
+        )
+        (group_sources, lib_name) = group
+        if lib_name:  # not a single module
+            shims = (([source], lib_name) for source in group_sources)
+            extensions.extend(_MypycShim(g, compiler_options, cflags) for g in shims)
+
+    if _PREPROCESSING_SUPPORTED:
+        return extensions
+
+    return [
+        ext._preprocess_deferred() for ext in
+        cast(list[_MypycBaseExtension], extensions)
+    ]
+
+
+def _separate_skip_cgen_groups(skip_cgen_input: Any | None = None) -> Iterator:
+    if skip_cgen_input:
+        return itertools.chain(skip_cgen_input, itertools.repeat([]))
+        # The _MypycExtension will consider `None` to indicate that there is
+        # no pre-generated files (all C files should be generated again).
+        # On the other hand, `[]` may indicate that no file should be
+        # generated (possibly files in the disk should be used).
+
+    return itertools.repeat(None)
+
+
+class _MypycBaseExtension(_base_Extension):
+    def _preprocess_deferred(self) -> Extension:
+        raise NotImplementedError
+
+    def preprocess(self, _build_ext: BuildExt) -> Extension:
+        return self._preprocess_deferred()
+
+
+class _MypycExtension(_MypycBaseExtension):
+    def __init__(
+        self,
+        group: emitmodule.Group,
+        options: Options,
+        compiler_options: CompilerOptions,
+        fscache: FileSystemCache,
+        extra_compile_args: list[str],
+        skip_cgen_group: Any | None = None,
+    ):
+        self._build_sources, self._group_name = group
+        self._options = options
+        self._skip_cgen_group = skip_cgen_group
+        self._compiler_options = compiler_options
+        self._fscache = fscache
+
+        src = [s.path for s in self._build_sources if s.path]
+        if self._group_name:
+            name: str = shared_lib_name(self._group_name)
+        else:
+            name = self._build_sources[0].module
+        assert name
+        super().__init__(name, src, extra_compile_args=extra_compile_args)
+
+    def _shared_cfilenames(self, build_dir) -> Iterator[str]:
+        # If configured to (defaults to yes in multi-file mode), copy the
+        # runtime library in. Otherwise it just gets #included to save on
+        # compiler invocations.
+        source_dir = include_dir()
+        if not self._compiler_options.include_runtime_files:
+            for name in RUNTIME_C_FILES:
+                yield self._shared_file(source_dir, build_dir, name)
+
+    def _shared_file(self, source_dir, build_dir, name):
+        rt_file = os.path.join(build_dir, name)
+        if not os.path.exists(rt_file):
+            with open(os.path.join(source_dir, name), encoding="utf-8") as f:
+                write_file(rt_file, f.read())
+        return rt_file
+
+    def _preprocess_deferred(self) -> Extension:
+        build_dir = self._compiler_options.target_dir
+        if not build_dir.startswith("build"):
+            raise ValueError(f"{build_dir=}")
+
+        # We let the test harness just pass in the c file contents instead
+        # so that it can do a corner-cutting version without full stubs.
+        if self._skip_cgen_group is None:
+            group_cfiles, ops_text = generate_c(
+                self._build_sources,
+                self._options,
+                [(self._build_sources, self._group_name)],
+                self._fscache,
+                compiler_options=self._compiler_options
+            )
+            # TODO: unique names?
+            write_file(os.path.join(build_dir, "ops.txt"), ops_text)
+        else:
+            group_cfiles = [self._skip_cgen_group]
+
+        # Write out the generated C and collect the files for each group
+        cfilenames: list[str] = []
+        deps: list[str] = []
+
+        for cfiles in group_cfiles:
+            for cfile, ctext in cfiles:
+                cfile = os.path.join(build_dir, cfile)
+                write_file(cfile, ctext)
+                if os.path.splitext(cfile)[1] == ".c":
+                    cfilenames.append(cfile)
+
+            deps.extend(
+                os.path.join(build_dir, dep)
+                for dep in get_header_deps(cfiles)
+            )
+
+        cfilenames.extend(self._shared_cfilenames(build_dir))
+
+        return Extension(
+            self.name,
+            sources=cfilenames,
+            include_dirs=[include_dir(), build_dir],
+            depends=deps,
+            extra_compile_args=self.extra_compile_args
+        )
+
+
+class _MypycShim(_MypycBaseExtension):
+    def __init__(
+        self,
+        group: emitmodule.Group,
+        compiler_options: CompilerOptions,
+        extra_compile_args: list[str],
+    ):
+        build_sources, group_name = group
+        source_path = build_sources[0].path
+        name = build_sources[0].module
+        src = [s.path for s in build_sources if s.path]
+        assert name
+        assert group_name
+        assert source_path
+
+        self._group_name = group_name
+        self._source_path = source_path
+        self._build_sources = build_sources
+        self._compiler_options = compiler_options
+
+        super().__init__(name, src, extra_compile_args=extra_compile_args)
+
+    def _preprocess_deferred(self) -> Extension:
+        build_dir = self._compiler_options.target_dir
+        module_name = self.name.split(".")[-1]
+        shim_file = generate_c_extension_shim(
+            self.name, module_name, build_dir, self._group_name
+        )
+
+        # We include the __init__ in the "module name" we stick in the Extension,
+        # since this seems to be needed for it to end up in the right place.
+        full_module_name = self.name
+        if os.path.split(self._source_path)[1] == "__init__.py":
+            full_module_name += ".__init__"
+
+        return Extension(
+            full_module_name,
+            sources=[shim_file],
+            extra_compile_args=self.extra_compile_args
+        )
+
+
+def _customize_compiler(
+    opt_level: str = "3",
+    debug_level: str = "1",
+    multi_file: bool = False,
+) -> list[str]:
+    # Mess around with setuptools and actually get the thing built
+    setup_mypycify_vars()
+
+    # Create a compiler object so we can make decisions based on what
+    # compiler is being used. typeshed is missing some attributes on the
+    # compiler object so we give it type Any
+    compiler: Any = ccompiler.new_compiler()
+    sysconfig.customize_compiler(compiler)
+
+    cflags: list[str] = []
+    if compiler.compiler_type == "unix":
+        cflags += [
+            f"-O{opt_level}",
+            f"-g{debug_level}",
+            "-Werror",
+            "-Wno-unused-function",
+            "-Wno-unused-label",
+            "-Wno-unreachable-code",
+            "-Wno-unused-variable",
+            "-Wno-unused-command-line-argument",
+            "-Wno-unknown-warning-option",
+            "-Wno-unused-but-set-variable",
+            "-Wno-ignored-optimization-argument",
+            # Disables C Preprocessor (cpp) warnings
+            # See https://github.com/mypyc/mypyc/issues/956
+            "-Wno-cpp",
+        ]
+    elif compiler.compiler_type == "msvc":
+        # msvc doesn't have levels, '/O2' is full and '/Od' is disable
+        if opt_level == "0":
+            opt_level = "d"
+        elif opt_level in ("1", "2", "3"):
+            opt_level = "2"
+        if debug_level == "0":
+            debug_level = "NONE"
+        elif debug_level == "1":
+            debug_level = "FASTLINK"
+        elif debug_level in ("2", "3"):
+            debug_level = "FULL"
+        cflags += [
+            f"/O{opt_level}",
+            f"/DEBUG:{debug_level}",
+            "/wd4102",  # unreferenced label
+            "/wd4101",  # unreferenced local variable
+            "/wd4146",  # negating unsigned int
+        ]
+        if multi_file:
+            # Disable whole program optimization in multi-file mode so
+            # that we actually get the compilation speed and memory
+            # use wins that multi-file mode is intended for.
+            cflags += ["/GL-", "/wd9025"]  # warning about overriding /GL
+
+    return cflags
