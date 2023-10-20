@@ -138,6 +138,7 @@ class TestRun(MypycDataSuite):
     optional_out = True
     multi_file = False
     separate = False  # If True, using separate (incremental) compilation
+    build_ext_args = ["--inplace"]
 
     def run_case(self, testcase: DataDrivenTestCase) -> None:
         # setup.py wants to be run from the root directory of the package, which we accommodate
@@ -270,7 +271,7 @@ class TestRun(MypycDataSuite):
                 )
             )
 
-        if not run_setup(setup_file, ["build_ext", "--inplace"]):
+        if not run_setup(setup_file, ["build_ext", *self.build_ext_args]):
             if testcase.config.getoption("--mypyc-showc"):
                 show_c(cfiles)
             assert False, "Compilation failed"
@@ -381,6 +382,15 @@ class TestRunMultiFile(TestRun):
     files = ["run-multimodule.test", "run-mypy-sim.test"]
 
 
+class TestRunMultiFileParallel(TestRun):
+    """``Multi-file`` tests in parallel (setuptools interop sanity check)."""
+
+    multi_file = True
+    test_name_suffix = "_multi_parallel"
+    files = ["run-mypy-sim.test"]
+    build_ext_args = ["--inplace", "--parallel", "3"]
+
+
 class TestRunSeparate(TestRun):
     """Run the main multi-module tests in separate compilation mode.
 
@@ -400,6 +410,15 @@ class TestRunSeparate(TestRun):
     separate = True
     test_name_suffix = "_separate"
     files = ["run-multimodule.test", "run-mypy-sim.test"]
+
+
+class TestRunSeparateParallel(TestRun):
+    """``Separate`` tests in parallel (setuptools interop sanity check)."""
+
+    separate = True
+    test_name_suffix = "_separate_parallel"
+    files = ["run-mypy-sim.test"]
+    build_ext_args = ["--inplace", "--parallel", "3"]
 
 
 def fix_native_line_number(message: str, fnam: str, delta: int) -> str:
