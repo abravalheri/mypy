@@ -473,7 +473,7 @@ def mypycify(
         return extensions
 
     # Compatibility with older versions of setuptools
-    return [ext._preprocess_deferred() for ext in cast(list[_MypycBaseExtension], extensions)]
+    return [cast(_MypycBaseExtension, ext)._preprocess_deferred() for ext in extensions]
 
 
 def _customize_compiler(
