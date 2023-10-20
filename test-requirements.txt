@@ -81,7 +81,10 @@ virtualenv==20.24.5
     # via pre-commit
 
 # The following packages are considered to be unsafe in a requirements file:
-setuptools==68.2.2
+# setuptools==68.2.2
+setuptools @ https://github.com/abravalheri/setuptools/archive/refs/heads/preprocessed-ext.zip  # temporary experiment
+# setuptools @ https://github.com/abravalheri/setuptools/archive/5ba8048928c193ca65f7b5aff36645fa99a12b17.zip  # temporary experiment
+# -e /home/abravalheri/workspace/setuptools
     # via
     #   -r test-requirements.in
     #   nodeenv
