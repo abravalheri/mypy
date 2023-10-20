@@ -85,20 +85,6 @@ else:
         _base_Extension = Extension
 
 
-def get_extension() -> type[Extension]:
-    # We can work with either setuptools or distutils, and pick setuptools
-    # if it has been imported.
-    use_setuptools = "setuptools" in sys.modules
-
-    if sys.version_info < (3, 12) and not use_setuptools:
-        import distutils.core
-
-        return distutils.core.Extension
-    if not use_setuptools:
-        sys.exit("error: setuptools not installed")
-    return setuptools.Extension
-
-
 def setup_mypycify_vars() -> None:
     """Rewrite a bunch of config vars in pretty dubious ways."""
     # There has to be a better approach to this.
@@ -265,71 +251,6 @@ def generate_c(
     return ctext, "\n".join(format_modules(modules))
 
 
-def build_using_shared_lib(
-    sources: list[BuildSource],
-    group_name: str,
-    cfiles: list[str],
-    deps: list[str],
-    build_dir: str,
-    extra_compile_args: list[str],
-) -> list[Extension]:
-    """Produce the list of extension modules when a shared library is needed.
-
-    This creates one shared library extension module that all of the
-    others import and then one shim extension module for each
-    module in the build, that simply calls an initialization function
-    in the shared library.
-
-    The shared library (which lib_name is the name of) is a python
-    extension module that exports the real initialization functions in
-    Capsules stored in module attributes.
-    """
-    extensions = [
-        get_extension()(
-            shared_lib_name(group_name),
-            sources=cfiles,
-            include_dirs=[include_dir(), build_dir],
-            depends=deps,
-            extra_compile_args=extra_compile_args,
-        )
-    ]
-
-    for source in sources:
-        module_name = source.module.split(".")[-1]
-        shim_file = generate_c_extension_shim(source.module, module_name, build_dir, group_name)
-
-        # We include the __init__ in the "module name" we stick in the Extension,
-        # since this seems to be needed for it to end up in the right place.
-        full_module_name = source.module
-        assert source.path
-        if os.path.split(source.path)[1] == "__init__.py":
-            full_module_name += ".__init__"
-        extensions.append(
-            get_extension()(
-                full_module_name, sources=[shim_file], extra_compile_args=extra_compile_args
-            )
-        )
-
-    return extensions
-
-
-def build_single_module(
-    sources: list[BuildSource], cfiles: list[str], extra_compile_args: list[str]
-) -> list[Extension]:
-    """Produce the list of extension modules for a standalone extension.
-
-    This contains just one module, since there is no need for a shared module.
-    """
-    return [
-        get_extension()(
-            sources[0].module,
-            sources=cfiles,
-            include_dirs=[include_dir()],
-            extra_compile_args=extra_compile_args,
-        )
-    ]
-
-
 def write_file(path: str, contents: str) -> None:
     """Write data into a file.
 
@@ -418,61 +339,67 @@ def get_header_deps(cfiles: list[tuple[str, str]]) -> list[str]:
     return sorted(headers)
 
 
-def mypyc_build(
-    paths: list[str],
-    compiler_options: CompilerOptions,
-    *,
-    separate: bool | list[tuple[list[str], str | None]] = False,
-    only_compile_paths: Iterable[str] | None = None,
-    skip_cgen_input: Any | None = None,
-    always_use_shared_lib: bool = False,
-) -> tuple[emitmodule.Groups, list[tuple[list[str], list[str]]]]:
-    """Do the front and middle end of mypyc building, producing and writing out C source."""
-    fscache = FileSystemCache()
-    mypyc_sources, all_sources, options = get_mypy_config(
-        paths, only_compile_paths, compiler_options, fscache
-    )
+def _customize_compiler(
+    opt_level: str = "3",
+    debug_level: str = "1",
+    multi_file: bool = False,
+) -> list[str]:
+    # Mess around with setuptools and actually get the thing built
+    setup_mypycify_vars()
 
-    # We generate a shared lib if there are multiple modules or if any
-    # of the modules are in package. (Because I didn't want to fuss
-    # around with making the single module code handle packages.)
-    use_shared_lib = (
-        len(mypyc_sources) > 1
-        or any("." in x.module for x in mypyc_sources)
-        or always_use_shared_lib
-    )
+    # Create a compiler object so we can make decisions based on what
+    # compiler is being used. typeshed is missing some attributes on the
+    # compiler object so we give it type Any
+    compiler: Any = ccompiler.new_compiler()
+    sysconfig.customize_compiler(compiler)
 
-    groups = construct_groups(mypyc_sources, separate, use_shared_lib)
+    cflags: list[str] = []
+    if compiler.compiler_type == "unix":
+        cflags += [
+            f"-O{opt_level}",
+            f"-g{debug_level}",
+            "-Werror",
+            "-Wno-unused-function",
+            "-Wno-unused-label",
+            "-Wno-unreachable-code",
+            "-Wno-unused-variable",
+            "-Wno-unused-command-line-argument",
+            "-Wno-unknown-warning-option",
+            "-Wno-unused-but-set-variable",
+            "-Wno-ignored-optimization-argument",
+            # Disables C Preprocessor (cpp) warnings
+            # See https://github.com/mypyc/mypyc/issues/956
+            "-Wno-cpp",
+        ]
+    elif compiler.compiler_type == "msvc":
+        # msvc doesn't have levels, '/O2' is full and '/Od' is disable
+        if opt_level == "0":
+            opt_level = "d"
+        elif opt_level in ("1", "2", "3"):
+            opt_level = "2"
+        if debug_level == "0":
+            debug_level = "NONE"
+        elif debug_level == "1":
+            debug_level = "FASTLINK"
+        elif debug_level in ("2", "3"):
+            debug_level = "FULL"
+        cflags += [
+            f"/O{opt_level}",
+            f"/DEBUG:{debug_level}",
+            "/wd4102",  # unreferenced label
+            "/wd4101",  # unreferenced local variable
+            "/wd4146",  # negating unsigned int
+        ]
+        if multi_file:
+            # Disable whole program optimization in multi-file mode so
+            # that we actually get the compilation speed and memory
+            # use wins that multi-file mode is intended for.
+            cflags += ["/GL-", "/wd9025"]  # warning about overriding /GL
 
-    # We let the test harness just pass in the c file contents instead
-    # so that it can do a corner-cutting version without full stubs.
-    if not skip_cgen_input:
-        group_cfiles, ops_text = generate_c(
-            all_sources, options, groups, fscache, compiler_options=compiler_options
-        )
-        # TODO: unique names?
-        write_file(os.path.join(compiler_options.target_dir, "ops.txt"), ops_text)
-    else:
-        group_cfiles = skip_cgen_input
-
-    # Write out the generated C and collect the files for each group
-    # Should this be here??
-    group_cfilenames: list[tuple[list[str], list[str]]] = []
-    for cfiles in group_cfiles:
-        cfilenames = []
-        for cfile, ctext in cfiles:
-            cfile = os.path.join(compiler_options.target_dir, cfile)
-            write_file(cfile, ctext)
-            if os.path.splitext(cfile)[1] == ".c":
-                cfilenames.append(cfile)
-
-        deps = [os.path.join(compiler_options.target_dir, dep) for dep in get_header_deps(cfiles)]
-        group_cfilenames.append((cfilenames, deps))
-
-    return groups, group_cfilenames
+    return cflags
 
 
-def _mypycify_orig(
+def mypycify(
     paths: list[str],
     *,
     only_compile_paths: Iterable[str] | None = None,
@@ -525,126 +452,6 @@ def _mypycify_orig(
                                separately in order to reduce compiler invocations.
                                Defaults to False in multi_file mode, True otherwise.
     """
-
-    # Figure out our configuration
-    compiler_options = CompilerOptions(
-        strip_asserts=strip_asserts,
-        multi_file=multi_file,
-        verbose=verbose,
-        separate=separate is not False,
-        target_dir=target_dir,
-        include_runtime_files=include_runtime_files,
-    )
-
-    # Generate all the actual important C code
-    groups, group_cfilenames = mypyc_build(
-        paths,
-        only_compile_paths=only_compile_paths,
-        compiler_options=compiler_options,
-        separate=separate,
-        skip_cgen_input=skip_cgen_input,
-    )
-
-    # Mess around with setuptools and actually get the thing built
-    setup_mypycify_vars()
-
-    # Create a compiler object so we can make decisions based on what
-    # compiler is being used. typeshed is missing some attributes on the
-    # compiler object so we give it type Any
-    compiler: Any = ccompiler.new_compiler()
-    sysconfig.customize_compiler(compiler)
-
-    build_dir = compiler_options.target_dir
-
-    cflags: list[str] = []
-    if compiler.compiler_type == "unix":
-        cflags += [
-            f"-O{opt_level}",
-            f"-g{debug_level}",
-            "-Werror",
-            "-Wno-unused-function",
-            "-Wno-unused-label",
-            "-Wno-unreachable-code",
-            "-Wno-unused-variable",
-            "-Wno-unused-command-line-argument",
-            "-Wno-unknown-warning-option",
-            "-Wno-unused-but-set-variable",
-            "-Wno-ignored-optimization-argument",
-            # Disables C Preprocessor (cpp) warnings
-            # See https://github.com/mypyc/mypyc/issues/956
-            "-Wno-cpp",
-        ]
-    elif compiler.compiler_type == "msvc":
-        # msvc doesn't have levels, '/O2' is full and '/Od' is disable
-        if opt_level == "0":
-            opt_level = "d"
-        elif opt_level in ("1", "2", "3"):
-            opt_level = "2"
-        if debug_level == "0":
-            debug_level = "NONE"
-        elif debug_level == "1":
-            debug_level = "FASTLINK"
-        elif debug_level in ("2", "3"):
-            debug_level = "FULL"
-        cflags += [
-            f"/O{opt_level}",
-            f"/DEBUG:{debug_level}",
-            "/wd4102",  # unreferenced label
-            "/wd4101",  # unreferenced local variable
-            "/wd4146",  # negating unsigned int
-        ]
-        if multi_file:
-            # Disable whole program optimization in multi-file mode so
-            # that we actually get the compilation speed and memory
-            # use wins that multi-file mode is intended for.
-            cflags += ["/GL-", "/wd9025"]  # warning about overriding /GL
-
-    # If configured to (defaults to yes in multi-file mode), copy the
-    # runtime library in. Otherwise it just gets #included to save on
-    # compiler invocations.
-    shared_cfilenames = []
-    if not compiler_options.include_runtime_files:
-        for name in RUNTIME_C_FILES:
-            rt_file = os.path.join(build_dir, name)
-            with open(os.path.join(include_dir(), name), encoding="utf-8") as f:
-                write_file(rt_file, f.read())
-            shared_cfilenames.append(rt_file)
-
-    extensions = []
-    for (group_sources, lib_name), (cfilenames, deps) in zip(groups, group_cfilenames):
-        if lib_name:
-            extensions.extend(
-                build_using_shared_lib(
-                    group_sources,
-                    lib_name,
-                    cfilenames + shared_cfilenames,
-                    deps,
-                    build_dir,
-                    cflags,
-                )
-            )
-        else:
-            extensions.extend(
-                build_single_module(group_sources, cfilenames + shared_cfilenames, cflags)
-            )
-
-    return extensions
-
-
-def mypycify(
-    paths: list[str],
-    *,
-    only_compile_paths: Iterable[str] | None = None,
-    verbose: bool = False,
-    opt_level: str = "3",
-    debug_level: str = "1",
-    strip_asserts: bool = False,
-    multi_file: bool = False,
-    separate: bool | list[tuple[list[str], str | None]] = False,
-    skip_cgen_input: Any | None = None,
-    target_dir: str | None = None,
-    include_runtime_files: bool | None = None,
-) -> list[Extension]:
     # Figure out our configuration
     compiler_options = CompilerOptions(
         strip_asserts=strip_asserts,
@@ -715,10 +522,23 @@ class _MypycBaseExtension(_base_Extension):
         raise NotImplementedError
 
     def preprocess(self, _build_ext: BuildExt) -> Extension:
+        """Hook that will be called just before each extension's compilation."""
         return self._preprocess_deferred()
 
 
 class _MypycExtension(_MypycBaseExtension):
+    """
+    If the user specifies multiple Python files at once,
+    this creates one shared library extension module that all of the
+    others import.
+    The shared library (which is named by the ``group``'s name) is a python
+    extension module that exports the real initialization functions in
+    Capsules stored in module attributes.
+
+    If the user specifies a single module, there is no need for a shared library
+    with shims. Instead, this creates a single extension module.
+    """
+
     def __init__(
         self,
         group: emitmodule.Group,
@@ -745,9 +565,7 @@ class _MypycExtension(_MypycBaseExtension):
         super().__init__(name, src, extra_compile_args=extra_compile_args)
 
     def create_shared_files(self, _build_ext: BuildExt) -> None:
-        # setuptools-specific callback that allows splitting the pre-processing
-        # and the compilation in 2 steps.
-
+        """Hook that allows creating files before anything else starts to compile."""
         if self._compiler_options.separate:
             # When "separating", we need to generate all files first (one step),
             # before attempting to compile the extension modules (another step).
@@ -795,9 +613,11 @@ class _MypycExtension(_MypycBaseExtension):
         return cfilenames, deps
 
     def _shared_cfilenames(self, build_dir) -> Iterator[str]:
-        # If configured to (defaults to yes in multi-file mode), copy the
-        # runtime library in. Otherwise it just gets #included to save on
-        # compiler invocations.
+        """
+        If configured to (defaults to yes in multi-file mode), copy the
+        runtime library in. Otherwise it just gets #included to save on
+        compiler invocations.
+        """
         source_dir = include_dir()
         if not self._compiler_options.include_runtime_files:
             for name in RUNTIME_C_FILES:
@@ -822,9 +642,14 @@ class _MypycExtension(_MypycBaseExtension):
 
 
 class _MypycShim(_MypycBaseExtension):
+    """Produce an extension that can be directly imported by the end user.
+    This extension does not contain much implementation itself,
+    but simply calls an initialization function in the shared library.
+    """
+
     def __init__(
         self,
-        group: emitmodule.Group,
+        group: emitmodule.Group,  # 1 group with 1 source
         compiler_options: CompilerOptions,
         extra_compile_args: list[str],
     ):
@@ -860,63 +685,3 @@ class _MypycShim(_MypycBaseExtension):
             sources=[shim_file],
             extra_compile_args=self.extra_compile_args
         )
-
-
-def _customize_compiler(
-    opt_level: str = "3",
-    debug_level: str = "1",
-    multi_file: bool = False,
-) -> list[str]:
-    # Mess around with setuptools and actually get the thing built
-    setup_mypycify_vars()
-
-    # Create a compiler object so we can make decisions based on what
-    # compiler is being used. typeshed is missing some attributes on the
-    # compiler object so we give it type Any
-    compiler: Any = ccompiler.new_compiler()
-    sysconfig.customize_compiler(compiler)
-
-    cflags: list[str] = []
-    if compiler.compiler_type == "unix":
-        cflags += [
-            f"-O{opt_level}",
-            f"-g{debug_level}",
-            "-Werror",
-            "-Wno-unused-function",
-            "-Wno-unused-label",
-            "-Wno-unreachable-code",
-            "-Wno-unused-variable",
-            "-Wno-unused-command-line-argument",
-            "-Wno-unknown-warning-option",
-            "-Wno-unused-but-set-variable",
-            "-Wno-ignored-optimization-argument",
-            # Disables C Preprocessor (cpp) warnings
-            # See https://github.com/mypyc/mypyc/issues/956
-            "-Wno-cpp",
-        ]
-    elif compiler.compiler_type == "msvc":
-        # msvc doesn't have levels, '/O2' is full and '/Od' is disable
-        if opt_level == "0":
-            opt_level = "d"
-        elif opt_level in ("1", "2", "3"):
-            opt_level = "2"
-        if debug_level == "0":
-            debug_level = "NONE"
-        elif debug_level == "1":
-            debug_level = "FASTLINK"
-        elif debug_level in ("2", "3"):
-            debug_level = "FULL"
-        cflags += [
-            f"/O{opt_level}",
-            f"/DEBUG:{debug_level}",
-            "/wd4102",  # unreferenced label
-            "/wd4101",  # unreferenced local variable
-            "/wd4146",  # negating unsigned int
-        ]
-        if multi_file:
-            # Disable whole program optimization in multi-file mode so
-            # that we actually get the compilation speed and memory
-            # use wins that multi-file mode is intended for.
-            cflags += ["/GL-", "/wd9025"]  # warning about overriding /GL
-
-    return cflags
