@@ -84,6 +84,14 @@ jobs:
           toxenv: py
           tox_extra_args: "-n 2 mypyc/test/test_run.py mypyc/test/test_external.py"
           debug_build: true
+        - name: mypyc runtime tests with old setuptools (backward compatibility)
+          python: '3.8.17'
+          arch: x64
+          os: ubuntu-latest
+          toxenv: py
+          tox_extra_args: "-n 2 mypyc/test/test_run.py mypyc/test/test_external.py"
+          setuptools_version: '50'  # Lowest version allowed in extras_require
+          debug_build: true
 
         - name: Type check our own code (py38-ubuntu)
           python: '3.8'
@@ -141,6 +149,12 @@ jobs:
         CC=clang MYPYC_OPT_LEVEL=0 MYPY_USE_MYPYC=1 pip install -e .
     - name: Setup tox environment
       run: tox run -e ${{ matrix.toxenv }} --notest
+    - name: Replace setuptools version
+      if: ${{ matrix.setuptools_version }}
+      run: |
+        tox exec -e ${{ matrix.toxenv }} -- pip uninstall -y setuptools  # ensure all files are gone
+        tox exec -e ${{ matrix.toxenv }} -- pip install 'setuptools ~= ${{ matrix.setuptools_version }}.0'
+        tox exec -e ${{ matrix.toxenv }} -- python -c 'import setuptools as x; assert x.__version__.startswith("${{ matrix.setuptools_version }}")'
     - name: Test
       run: tox run -e ${{ matrix.toxenv }} --skip-pkg-install -- ${{ matrix.tox_extra_args }}
 
