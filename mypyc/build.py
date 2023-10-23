@@ -35,6 +35,13 @@ from mypy.fscache import FileSystemCache
 from mypy.main import process_options
 from mypy.options import Options
 from mypy.util import write_junit_xml
+from mypyc._setuptools_extensions import (
+    _PREPROCESSING_SUPPORTED,
+    Extension,
+    _MypycBaseExtension,
+    _MypycExtension,
+    _MypycShim,
+)
 from mypyc.codegen import emitmodule
 from mypyc.common import RUNTIME_C_FILES, shared_lib_name
 from mypyc.errors import Errors
@@ -42,20 +49,9 @@ from mypyc.ir.pprint import format_modules
 from mypyc.namegen import exported_name
 from mypyc.options import CompilerOptions
 
-try:
-    # Import setuptools so that it monkey-patch overrides distutils
-    import setuptools  # noqa: F401
-except ImportError:
-    pass
-
 if sys.version_info < (3, 12):
     from distutils import ccompiler, sysconfig
-    from distutils.command.build_ext import build_ext as BuildExt
-    from distutils.core import Extension  # monkey-patched by setuptools
 else:
-    from setuptools import Extension
-    from setuptools.command.build_ext import build_ext as BuildExt
-
     if TYPE_CHECKING:
         # Do not import setuptools._distutils directly as it can cause
         # runtime problems (e.g.: pypa/setuptools#3743).
@@ -63,26 +59,13 @@ else:
             ccompiler as _ccompiler,  # type: ignore[attr-defined]
             sysconfig as _sysconfig,  # type: ignore[attr-defined]
         )
-
-        ccompiler = _ccompiler
-        sysconfig = _sysconfig
     else:
         # The only supported way of importing distutils in Python 3.12+
         # is via setuptools' MetaPathFinder.
-        from distutils import ccompiler, sysconfig
+        from distutils import ccompiler as _ccompiler, sysconfig as _sysconfig
 
-_PREPROCESSING_SUPPORTED: bool = False
-
-if TYPE_CHECKING:
-    _base_Extension = Extension
-else:
-    try:
-        from setuptools.extension import PreprocessedExtension  # type: ignore[import]
-
-        _PREPROCESSING_SUPPORTED = True
-        _base_Extension = PreprocessedExtension
-    except ImportError:
-        _base_Extension = Extension
+    ccompiler = _ccompiler
+    sysconfig = _sysconfig
 
 
 def setup_mypycify_vars() -> None:
@@ -249,6 +232,75 @@ def generate_c(
         print(f"Compiled to C in {t2 - t1:.3f}s")
 
     return ctext, "\n".join(format_modules(modules))
+
+
+def _create_extension(
+    group: emitmodule.Group,
+    options: Options,
+    compiler_options: CompilerOptions,
+    fscache: FileSystemCache,
+    extra_compile_args: list[str],
+    skip_cgen_group: list[tuple[str, str]] | None = None,
+) -> _MypycExtension:
+    """Simple wrapper around class, so that all computations can be compiled.
+
+    If the user specifies multiple Python files at once,
+    this creates one shared library extension module that all of the others import.
+    The shared library (which is named by the ``group``'s name) is a python
+    extension module that exports the real initialization functions in
+    Capsules stored in module attributes.
+
+    If the user specifies a single module, there is no need for a shared library
+    with shims. Instead, this creates a single extension module.
+    """
+    include_dirs = [include_dir(), compiler_options.target_dir]
+    build_sources, group_name = group
+    src = [s.path for s in build_sources if s.path]
+    name = shared_lib_name(group_name) if group_name else build_sources[0].module
+    assert name
+
+    return _MypycExtension(
+        name,
+        src,
+        group,
+        options,
+        compiler_options,
+        fscache,
+        include_dirs,
+        extra_compile_args,
+        skip_cgen_group,
+    )
+
+
+def _create_shim(
+    group: emitmodule.Group,  # 1 group with 1 source
+    compiler_options: CompilerOptions,
+    extra_compile_args: list[str],
+) -> _MypycShim:
+    """Simple wrapper around class, so that any computation can be compiled.
+
+    Produce an extension that can be directly imported by the end user.
+    This extension does not contain much implementation itself,
+    but simply calls an initialization function in the shared library.
+    """
+    build_sources, group_name = group
+    source_path = build_sources[0].path
+    name = build_sources[0].module
+    src = [s.path for s in build_sources if s.path]
+    assert name
+    assert group_name
+    assert source_path
+
+    module = name
+    module_name = module.rpartition(".")[-1]
+    if os.path.split(source_path)[1] == "__init__.py":
+        # We include the __init__ in the "module name" we stick in the Extension,
+        # since this seems to be needed for it to end up in the right place.
+        name += ".__init__"
+
+    return _MypycShim(
+        name, src, group_name, module, module_name, compiler_options, extra_compile_args
+    )
 
 
 def write_file(path: str, contents: str) -> None:
@@ -461,12 +513,12 @@ def mypycify(
     extensions: list[Extension] = []
     for group, skip_cgen_group in zip(groups, pregenerated):
         extensions.append(
-            _MypycExtension(group, options, compiler_options, fscache, cflags, skip_cgen_group)
+            _create_extension(group, options, compiler_options, fscache, cflags, skip_cgen_group)
         )
         (group_sources, lib_name) = group
         if lib_name:  # not a single module
             shims = (([source], lib_name) for source in group_sources)
-            extensions.extend(_MypycShim(g, compiler_options, cflags) for g in shims)
+            extensions.extend(_create_shim(g, compiler_options, cflags) for g in shims)
 
     if _PREPROCESSING_SUPPORTED:
         # New versions of setuptools allow deferring the generation of files
@@ -563,121 +615,3 @@ def _iterate_skip_cgen_groups(
         # generated (possibly files in the disk should be used).
 
     return itertools.repeat(None)
-
-
-class _MypycBaseExtension(_base_Extension):
-    def _preprocess_deferred(self) -> Extension:
-        raise NotImplementedError
-
-    def preprocess(self, _build_ext: BuildExt) -> Extension:
-        """Hook that will be called just before each extension's compilation."""
-        return self._preprocess_deferred()
-
-
-class _MypycExtension(_MypycBaseExtension):
-    """
-    If the user specifies multiple Python files at once,
-    this creates one shared library extension module that all of the others import.
-    The shared library (which is named by the ``group``'s name) is a python
-    extension module that exports the real initialization functions in
-    Capsules stored in module attributes.
-
-    If the user specifies a single module, there is no need for a shared library
-    with shims. Instead, this creates a single extension module.
-    """
-
-    def __init__(
-        self,
-        group: emitmodule.Group,
-        options: Options,
-        compiler_options: CompilerOptions,
-        fscache: FileSystemCache,
-        extra_compile_args: list[str],
-        skip_cgen_group: list[tuple[str, str]] | None = None,
-    ):
-        self._group = group
-        self._options = options
-        self._skip_cgen_group = skip_cgen_group
-        self._compiler_options = compiler_options
-        self._fscache = fscache
-        self._created_files: tuple[list[str], list[str]] | None = None  # sources, deps
-
-        build_sources, group_name = group
-        src = [s.path for s in build_sources if s.path]
-        name = shared_lib_name(group_name) if group_name else build_sources[0].module
-        assert name
-
-        super().__init__(name, src, extra_compile_args=extra_compile_args)
-
-    def create_shared_files(self, _build_ext: BuildExt) -> None:
-        """Hook that allows creating files before anything else starts to compile."""
-        if self._compiler_options.separate:
-            # When "separating", we need to generate all files first (one step),
-            # before attempting to compile the extension modules (another step).
-            # This way one module can depend on header files generated by another one.
-            self._created_files = self._create_files()
-            # If not separating, the shared library can be pre-processed and compiled
-            # in a single step.
-
-    def _preprocess_deferred(self) -> Extension:
-        cfilenames, deps = self._created_files or self._create_files()
-        return Extension(
-            self.name,
-            sources=cfilenames,
-            include_dirs=[include_dir(), self._compiler_options.target_dir],
-            depends=deps,
-            extra_compile_args=self.extra_compile_args,
-        )
-
-    def _create_files(self) -> tuple[list[str], list[str]]:
-        return _mypyc_create_files(
-            self._group,
-            self._compiler_options,
-            self._options,
-            self._fscache,
-            self._skip_cgen_group,
-        )
-
-
-class _MypycShim(_MypycBaseExtension):
-    """Produce an extension that can be directly imported by the end user.
-    This extension does not contain much implementation itself,
-    but simply calls an initialization function in the shared library.
-    """
-
-    def __init__(
-        self,
-        group: emitmodule.Group,  # 1 group with 1 source
-        compiler_options: CompilerOptions,
-        extra_compile_args: list[str],
-    ):
-        build_sources, group_name = group
-        source_path = build_sources[0].path
-        name = build_sources[0].module
-        src = [s.path for s in build_sources if s.path]
-        assert name
-        assert group_name
-        assert source_path
-
-        self._module = name
-        self._group_name = group_name
-        self._source_path = source_path
-        self._compiler_options = compiler_options
-
-        if os.path.split(source_path)[1] == "__init__.py":
-            # We include the __init__ in the "module name" we stick in the Extension,
-            # since this seems to be needed for it to end up in the right place.
-            name += ".__init__"
-
-        super().__init__(name, src, extra_compile_args=extra_compile_args)
-
-    def _preprocess_deferred(self) -> Extension:
-        build_dir = self._compiler_options.target_dir
-        module_name = self._module.rpartition(".")[-1]
-        shim_file = generate_c_extension_shim(
-            self._module, module_name, build_dir, self._group_name
-        )
-
-        return Extension(
-            self.name, sources=[shim_file], extra_compile_args=self.extra_compile_args
-        )
