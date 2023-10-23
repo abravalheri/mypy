@@ -27,7 +27,7 @@ import re
 import sys
 import time
 from tempfile import NamedTemporaryFile
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, NoReturn, cast
+from typing import Any, Dict, Iterable, Iterator, NoReturn, cast
 
 from mypy.build import BuildSource
 from mypy.errors import CompileError
@@ -49,23 +49,15 @@ from mypyc.ir.pprint import format_modules
 from mypyc.namegen import exported_name
 from mypyc.options import CompilerOptions
 
-if sys.version_info < (3, 12):
-    from distutils import ccompiler, sysconfig
-else:
-    if TYPE_CHECKING:
-        # Do not import setuptools._distutils directly as it can cause
-        # runtime problems (e.g.: pypa/setuptools#3743).
-        from setuptools._distutils import (
-            ccompiler as _ccompiler,  # type: ignore[attr-defined]
-            sysconfig as _sysconfig,  # type: ignore[attr-defined]
-        )
-    else:
-        # The only supported way of importing distutils in Python 3.12+
-        # is via setuptools' MetaPathFinder.
-        from distutils import ccompiler as _ccompiler, sysconfig as _sysconfig
-
-    ccompiler = _ccompiler
-    sysconfig = _sysconfig
+try:
+    # Do not try to import setuptools._distutils directly as it can cause
+    # runtime problems (e.g.: pypa/setuptools#3743).
+    # The only supported way of importing distutils in Python 3.12+
+    # is via setuptools' MetaPathFinder
+    from distutils import ccompiler, sysconfig  # type: ignore[import-not-found]
+except ImportError:
+    # This part should not be reached anyway ...
+    from setuptools._distutils import ccompiler, sysconfig  # type: ignore[no-redef]
 
 
 def setup_mypycify_vars() -> None:

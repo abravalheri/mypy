@@ -6,12 +6,12 @@ The classes defined here are not very clever and should as much as
 possible just delegate to ``mypyc/build.py``'s compiled functions.
 """
 import sys
+from typing_extensions import TypeAlias
 
 from mypy.fscache import FileSystemCache
 from mypy.options import Options
 from mypyc.codegen.emitmodule import Group
 from mypyc.options import CompilerOptions
-from typing_extensions import TypeAlias
 
 __all__ = [
     "Extension",  # re-export so we can use it in other files
@@ -20,7 +20,6 @@ __all__ = [
     "_MypycShim",
     "_PREPROCESSING_SUPPORTED",
 ]
-
 
 
 try:
@@ -35,7 +34,6 @@ except ImportError:
 
 
 if sys.version_info < (3, 12):
-    from distutils import ccompiler, sysconfig
     from distutils.command.build_ext import build_ext as BuildExt
     from distutils.core import Extension  # monkey-patched by setuptools
 else:
@@ -47,10 +45,9 @@ _base_Extension: TypeAlias = Extension
 
 try:
     from setuptools.extension import PreprocessedExtension  # type: ignore[attr-defined]
-    _base_Extension = PreprocessedExtension  # type: ignore
-    _PREPROCESSING_SUPPORTED = True
-    """Preprocessing hooks will be called automatically by setuptools."""
 
+    _base_Extension = PreprocessedExtension  # type: ignore[misc]
+    _PREPROCESSING_SUPPORTED = True
 except ImportError:
     _PREPROCESSING_SUPPORTED = False
 
@@ -95,10 +92,7 @@ class _MypycExtension(_MypycBaseExtension):
         self._fscache = fscache
         self._created_files: tuple[list[str], list[str]] | None = None  # sources, deps
         super().__init__(
-            name,
-            sources,
-            include_dirs=include_dirs,
-            extra_compile_args=extra_compile_args
+            name, sources, include_dirs=include_dirs, extra_compile_args=extra_compile_args
         )
 
     def create_shared_files(self, _build_ext: BuildExt) -> None:
