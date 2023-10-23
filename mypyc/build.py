@@ -49,6 +49,10 @@ from mypyc.ir.pprint import format_modules
 from mypyc.namegen import exported_name
 from mypyc.options import CompilerOptions
 
+# mypy: warn-unused-ignores=false
+# ^-- The type checker may think that distutils is not available on Python 3.12+
+#     (but it is, via setuptools).
+
 try:
     # Do not try to import setuptools._distutils directly as it can cause
     # runtime problems (e.g.: pypa/setuptools#3743).
