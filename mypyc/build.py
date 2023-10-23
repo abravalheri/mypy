@@ -56,7 +56,8 @@ try:
     # is via setuptools' MetaPathFinder
     from distutils import ccompiler, sysconfig  # type: ignore[import-not-found]
 except ImportError:
-    # This part should not be reached anyway ...
+    # This part should not be reached anyway (due to setuptools' MetaPathFinder)...
+    # Only useful to raise another ImportError if setuptools is not installed
     from setuptools._distutils import ccompiler, sysconfig  # type: ignore[no-redef]
 
 

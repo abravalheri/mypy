@@ -5,6 +5,8 @@ the interpreted classes in ``setuptools``
 The classes defined here are not very clever and should as much as
 possible just delegate to ``mypyc/build.py``'s compiled functions.
 """
+from __future__ import annotations
+
 import sys
 from typing_extensions import TypeAlias
 
