@@ -56,13 +56,15 @@ class TestCommandLine(MypycDataSuite):
                 cwd="tmp",
                 env=env,
             )
+
+            # Strip out setuptools build related output since we're only
+            # interested in the messages emitted during compilation.
             if "ErrorOutput" in testcase.name or cmd.returncode != 0:
-                out += cmd.stdout
-            elif "WarningOutput" in testcase.name:
-                # Strip out setuptools build related output since we're only
-                # interested in the messages emitted during compilation.
-                messages, _, _ = cmd.stdout.partition(b"running build_ext")
-                out += messages
+                _, _, messages = cmd.stdout.rpartition(b"running build_ext")
+                out += messages.strip()
+            if "WarningOutput" in testcase.name:
+                lines = [x for x in cmd.stdout.splitlines(True) if b": warning: " in x]
+                out += b"".join(lines)
 
             if cmd.returncode == 0:
                 # Run main program
