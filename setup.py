@@ -118,6 +118,8 @@ if USE_MYPYC:
         os.path.join("mypyc", "lib-rt", "setup.py"),
         # Uses __file__ at top level https://github.com/mypyc/mypyc/issues/700
         os.path.join("mypyc", "__main__.py"),
+        # Class inheritance from interpreted class
+        os.path.join("mypyc", "_setuptools_extension.py"),
     )
 
     everything = [os.path.join("mypy", x) for x in find_package_data("mypy", ["*.py"])] + [
