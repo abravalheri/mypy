@@ -21,11 +21,13 @@ hackily decide based on whether setuptools has been imported already.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import os.path
 import re
 import sys
 import time
-from typing import TYPE_CHECKING, Any, Dict, Iterable, NoReturn, Union, cast
+from tempfile import NamedTemporaryFile
+from typing import Any, Dict, Iterable, Iterator, NoReturn, cast
 
 from mypy.build import BuildSource
 from mypy.errors import CompileError
@@ -33,6 +35,13 @@ from mypy.fscache import FileSystemCache
 from mypy.main import process_options
 from mypy.options import Options
 from mypy.util import write_junit_xml
+from mypyc._setuptools_extensions import (
+    _PREPROCESSING_SUPPORTED,
+    Extension,
+    _MypycBaseExtension,
+    _MypycExtension,
+    _MypycShim,
+)
 from mypyc.codegen import emitmodule
 from mypyc.common import RUNTIME_C_FILES, shared_lib_name
 from mypyc.errors import Errors
@@ -40,49 +49,20 @@ from mypyc.ir.pprint import format_modules
 from mypyc.namegen import exported_name
 from mypyc.options import CompilerOptions
 
-if sys.version_info < (3, 12):
-    if TYPE_CHECKING:
-        from distutils.core import Extension as _distutils_Extension
-        from typing_extensions import TypeAlias
+# mypy: warn-unused-ignores=false
+# ^-- The type checker may think that distutils is not available on Python 3.12+
+#     (but it is, via setuptools).
 
-        from setuptools import Extension as _setuptools_Extension
-
-        Extension: TypeAlias = Union[_setuptools_Extension, _distutils_Extension]
-
-    try:
-        # Import setuptools so that it monkey-patch overrides distutils
-        import setuptools
-    except ImportError:
-        pass
-    from distutils import ccompiler, sysconfig
-else:
-    import setuptools
-    from setuptools import Extension
-    from setuptools._distutils import (
-        ccompiler as _ccompiler,  # type: ignore[attr-defined]
-        sysconfig as _sysconfig,  # type: ignore[attr-defined]
-    )
-
-    ccompiler = _ccompiler
-    sysconfig = _sysconfig
-
-
-def get_extension() -> type[Extension]:
-    # We can work with either setuptools or distutils, and pick setuptools
-    # if it has been imported.
-    use_setuptools = "setuptools" in sys.modules
-    extension_class: type[Extension]
-
-    if sys.version_info < (3, 12) and not use_setuptools:
-        import distutils.core
-
-        extension_class = distutils.core.Extension
-    else:
-        if not use_setuptools:
-            sys.exit("error: setuptools not installed")
-        extension_class = setuptools.Extension
-
-    return extension_class
+try:
+    # Do not try to import setuptools._distutils directly as it can cause
+    # runtime problems (e.g.: pypa/setuptools#3743).
+    # The only supported way of importing distutils in Python 3.12+
+    # is via setuptools' MetaPathFinder
+    from distutils import ccompiler, sysconfig  # type: ignore[import-not-found]
+except ImportError:
+    # This part should not be reached anyway (due to setuptools' MetaPathFinder)...
+    # Only useful to raise another ImportError if setuptools is not installed
+    from setuptools._distutils import ccompiler, sysconfig  # type: ignore[no-redef]
 
 
 def setup_mypycify_vars() -> None:
@@ -208,7 +188,7 @@ def generate_c(
     groups: emitmodule.Groups,
     fscache: FileSystemCache,
     compiler_options: CompilerOptions,
-) -> tuple[list[list[tuple[str, str]]], str]:
+) -> tuple[list[emitmodule.FileContents], str]:
     """Drive the actual core compilation step.
 
     The groups argument describes how modules are assigned to C
@@ -251,69 +231,73 @@ def generate_c(
     return ctext, "\n".join(format_modules(modules))
 
 
-def build_using_shared_lib(
-    sources: list[BuildSource],
-    group_name: str,
-    cfiles: list[str],
-    deps: list[str],
-    build_dir: str,
+def _create_extension(
+    group: emitmodule.Group,
+    options: Options,
+    compiler_options: CompilerOptions,
+    fscache: FileSystemCache,
     extra_compile_args: list[str],
-) -> list[Extension]:
-    """Produce the list of extension modules when a shared library is needed.
+    skip_cgen_group: list[tuple[str, str]] | None = None,
+) -> _MypycExtension:
+    """Simple wrapper around class, so that all computations can be compiled.
 
-    This creates one shared library extension module that all of the
-    others import and then one shim extension module for each
-    module in the build, that simply calls an initialization function
-    in the shared library.
-
-    The shared library (which lib_name is the name of) is a python
+    If the user specifies multiple Python files at once,
+    this creates one shared library extension module that all of the others import.
+    The shared library (which is named by the ``group``'s name) is a python
     extension module that exports the real initialization functions in
     Capsules stored in module attributes.
+
+    If the user specifies a single module, there is no need for a shared library
+    with shims. Instead, this creates a single extension module.
     """
-    extensions = [
-        get_extension()(
-            shared_lib_name(group_name),
-            sources=cfiles,
-            include_dirs=[include_dir(), build_dir],
-            depends=deps,
-            extra_compile_args=extra_compile_args,
-        )
-    ]
+    include_dirs = [include_dir(), compiler_options.target_dir]
+    build_sources, group_name = group
+    src = [s.path for s in build_sources if s.path]
+    name = shared_lib_name(group_name) if group_name else build_sources[0].module
+    assert name
 
-    for source in sources:
-        module_name = source.module.split(".")[-1]
-        shim_file = generate_c_extension_shim(source.module, module_name, build_dir, group_name)
+    return _MypycExtension(
+        name,
+        src,
+        group,
+        options,
+        compiler_options,
+        fscache,
+        include_dirs,
+        extra_compile_args,
+        skip_cgen_group,
+    )
 
+
+def _create_shim(
+    group: emitmodule.Group,  # 1 group with 1 source
+    compiler_options: CompilerOptions,
+    extra_compile_args: list[str],
+) -> _MypycShim:
+    """Simple wrapper around class, so that any computation can be compiled.
+
+    Produce an extension that can be directly imported by the end user.
+    This extension does not contain much implementation itself,
+    but simply calls an initialization function in the shared library.
+    """
+    build_sources, group_name = group
+    source_path = build_sources[0].path
+    name = build_sources[0].module
+    src = [s.path for s in build_sources if s.path]
+    assert name
+    assert group_name
+    assert source_path
+
+    module = name
+    module_name = module.rpartition(".")[-1]
+    if os.path.split(source_path)[1] == "__init__.py":
         # We include the __init__ in the "module name" we stick in the Extension,
         # since this seems to be needed for it to end up in the right place.
-        full_module_name = source.module
-        assert source.path
-        if os.path.split(source.path)[1] == "__init__.py":
-            full_module_name += ".__init__"
-        extensions.append(
-            get_extension()(
-                full_module_name, sources=[shim_file], extra_compile_args=extra_compile_args
-            )
-        )
+        name += ".__init__"
 
-    return extensions
-
-
-def build_single_module(
-    sources: list[BuildSource], cfiles: list[str], extra_compile_args: list[str]
-) -> list[Extension]:
-    """Produce the list of extension modules for a standalone extension.
-
-    This contains just one module, since there is no need for a shared module.
-    """
-    return [
-        get_extension()(
-            sources[0].module,
-            sources=cfiles,
-            include_dirs=[include_dir()],
-            extra_compile_args=extra_compile_args,
-        )
-    ]
+    return _MypycShim(
+        name, src, group_name, module, module_name, compiler_options, extra_compile_args
+    )
 
 
 def write_file(path: str, contents: str) -> None:
@@ -332,16 +316,21 @@ def write_file(path: str, contents: str) -> None:
     except OSError:
         old_contents = None
     if old_contents != encoded_contents:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "wb") as g:
+        parent = os.path.dirname(path)
+        os.makedirs(parent, exist_ok=True)
+
+        # Use a temporary file and then os.replace for atomicity in parallel builds
+        with NamedTemporaryFile("wb", dir=parent, delete=False) as g:
+            temp = g.name
             g.write(encoded_contents)
 
         # Fudge the mtime forward because otherwise when two builds happen close
         # together (like in a test) setuptools might not realize the source is newer
         # than the new artifact.
         # XXX: This is bad though.
-        new_mtime = os.stat(path).st_mtime + 1
-        os.utime(path, times=(new_mtime, new_mtime))
+        new_mtime = os.stat(temp).st_mtime + 1
+        os.utime(temp, times=(new_mtime, new_mtime))
+        os.replace(temp, path)
 
 
 def construct_groups(
@@ -399,58 +388,44 @@ def get_header_deps(cfiles: list[tuple[str, str]]) -> list[str]:
     return sorted(headers)
 
 
-def mypyc_build(
-    paths: list[str],
+def _mypyc_create_files(
+    group: emitmodule.Group,
     compiler_options: CompilerOptions,
-    *,
-    separate: bool | list[tuple[list[str], str | None]] = False,
-    only_compile_paths: Iterable[str] | None = None,
-    skip_cgen_input: Any | None = None,
-    always_use_shared_lib: bool = False,
-) -> tuple[emitmodule.Groups, list[tuple[list[str], list[str]]]]:
+    options: Options,
+    fscache: FileSystemCache,
+    skip_cgen_group: emitmodule.FileContents | None = None,
+) -> tuple[list[str], list[str]]:
     """Do the front and middle end of mypyc building, producing and writing out C source."""
-    fscache = FileSystemCache()
-    mypyc_sources, all_sources, options = get_mypy_config(
-        paths, only_compile_paths, compiler_options, fscache
-    )
-
-    # We generate a shared lib if there are multiple modules or if any
-    # of the modules are in package. (Because I didn't want to fuss
-    # around with making the single module code handle packages.)
-    use_shared_lib = (
-        len(mypyc_sources) > 1
-        or any("." in x.module for x in mypyc_sources)
-        or always_use_shared_lib
-    )
-
-    groups = construct_groups(mypyc_sources, separate, use_shared_lib)
+    build_dir = compiler_options.target_dir
+    build_sources, group_name = group
 
     # We let the test harness just pass in the c file contents instead
     # so that it can do a corner-cutting version without full stubs.
-    if not skip_cgen_input:
+    if skip_cgen_group is None:
         group_cfiles, ops_text = generate_c(
-            all_sources, options, groups, fscache, compiler_options=compiler_options
+            build_sources, options, [group], fscache, compiler_options
         )
         # TODO: unique names?
-        write_file(os.path.join(compiler_options.target_dir, "ops.txt"), ops_text)
+        write_file(os.path.join(build_dir, "ops.txt"), ops_text)
     else:
-        group_cfiles = skip_cgen_input
+        group_cfiles = [skip_cgen_group]
 
     # Write out the generated C and collect the files for each group
-    # Should this be here??
-    group_cfilenames: list[tuple[list[str], list[str]]] = []
+    cfilenames: list[str] = []
+    deps: list[str] = []
+
     for cfiles in group_cfiles:
-        cfilenames = []
         for cfile, ctext in cfiles:
-            cfile = os.path.join(compiler_options.target_dir, cfile)
+            cfile = os.path.join(build_dir, cfile)
             write_file(cfile, ctext)
             if os.path.splitext(cfile)[1] == ".c":
                 cfilenames.append(cfile)
 
-        deps = [os.path.join(compiler_options.target_dir, dep) for dep in get_header_deps(cfiles)]
-        group_cfilenames.append((cfilenames, deps))
+        deps.extend(os.path.join(build_dir, dep) for dep in get_header_deps(cfiles))
 
-    return groups, group_cfilenames
+    cfilenames.extend(_shared_cfilenames(build_dir, compiler_options))
+
+    return cfilenames, deps
 
 
 def mypycify(
@@ -463,7 +438,7 @@ def mypycify(
     strip_asserts: bool = False,
     multi_file: bool = False,
     separate: bool | list[tuple[list[str], str | None]] = False,
-    skip_cgen_input: Any | None = None,
+    skip_cgen_input: Iterable[emitmodule.FileContents] | None = None,
     target_dir: str | None = None,
     include_runtime_files: bool | None = None,
 ) -> list[Extension]:
@@ -517,15 +492,42 @@ def mypycify(
         include_runtime_files=include_runtime_files,
     )
 
-    # Generate all the actual important C code
-    groups, group_cfilenames = mypyc_build(
-        paths,
-        only_compile_paths=only_compile_paths,
-        compiler_options=compiler_options,
-        separate=separate,
-        skip_cgen_input=skip_cgen_input,
+    # Consider config file
+    fscache = FileSystemCache()
+    mypyc_sources, _all_sources, options = get_mypy_config(
+        paths, only_compile_paths, compiler_options, fscache
     )
 
+    # We generate a shared lib if there are multiple modules or if any
+    # of the modules are in package. (Because I didn't want to fuss
+    # around with making the single module code handle packages.)
+    use_shared_lib = len(mypyc_sources) > 1 or any("." in x.module for x in mypyc_sources)
+
+    groups = construct_groups(mypyc_sources, separate, use_shared_lib)
+    cflags = _customize_compiler(opt_level, debug_level, multi_file)
+    pregenerated = _iterate_skip_cgen_groups(skip_cgen_input)
+
+    extensions: list[Extension] = []
+    for group, skip_cgen_group in zip(groups, pregenerated):
+        extensions.append(
+            _create_extension(group, options, compiler_options, fscache, cflags, skip_cgen_group)
+        )
+        (group_sources, lib_name) = group
+        if lib_name:  # not a single module
+            shims = (([source], lib_name) for source in group_sources)
+            extensions.extend(_create_shim(g, compiler_options, cflags) for g in shims)
+
+    if _PREPROCESSING_SUPPORTED:
+        # New versions of setuptools allow deferring the generation of files
+        return extensions
+
+    # Compatibility with older versions of setuptools
+    return [cast(_MypycBaseExtension, ext)._preprocess_deferred() for ext in extensions]
+
+
+def _customize_compiler(
+    opt_level: str = "3", debug_level: str = "1", multi_file: bool = False
+) -> list[str]:
     # Mess around with setuptools and actually get the thing built
     setup_mypycify_vars()
 
@@ -534,8 +536,6 @@ def mypycify(
     # compiler object so we give it type Any
     compiler: Any = ccompiler.new_compiler()
     sysconfig.customize_compiler(compiler)
-
-    build_dir = compiler_options.target_dir
 
     cflags: list[str] = []
     if compiler.compiler_type == "unix":
@@ -580,33 +580,35 @@ def mypycify(
             # use wins that multi-file mode is intended for.
             cflags += ["/GL-", "/wd9025"]  # warning about overriding /GL
 
+    return cflags
+
+
+def _shared_cfilenames(build_dir: str, compiler_options: CompilerOptions) -> Iterator[str]:
     # If configured to (defaults to yes in multi-file mode), copy the
     # runtime library in. Otherwise it just gets #included to save on
     # compiler invocations.
-    shared_cfilenames = []
+    source_dir = include_dir()
     if not compiler_options.include_runtime_files:
         for name in RUNTIME_C_FILES:
-            rt_file = os.path.join(build_dir, name)
-            with open(os.path.join(include_dir(), name), encoding="utf-8") as f:
-                write_file(rt_file, f.read())
-            shared_cfilenames.append(rt_file)
+            yield _shared_file(source_dir, build_dir, name)
 
-    extensions = []
-    for (group_sources, lib_name), (cfilenames, deps) in zip(groups, group_cfilenames):
-        if lib_name:
-            extensions.extend(
-                build_using_shared_lib(
-                    group_sources,
-                    lib_name,
-                    cfilenames + shared_cfilenames,
-                    deps,
-                    build_dir,
-                    cflags,
-                )
-            )
-        else:
-            extensions.extend(
-                build_single_module(group_sources, cfilenames + shared_cfilenames, cflags)
-            )
 
-    return extensions
+def _shared_file(source_dir: str, build_dir: str, name: str) -> str:
+    rt_file = os.path.join(build_dir, name)
+    if not os.path.exists(rt_file):
+        with open(os.path.join(source_dir, name), encoding="utf-8") as f:
+            write_file(rt_file, f.read())
+    return rt_file
+
+
+def _iterate_skip_cgen_groups(
+    skip_cgen_input: Iterable[emitmodule.FileContents] | None,
+) -> Iterator[emitmodule.FileContents | None]:
+    if skip_cgen_input:
+        return itertools.chain(skip_cgen_input, itertools.repeat([]))
+        # The _MypycExtension will consider `None` to indicate that there is
+        # no pre-generated files (all C files should be generated again).
+        # On the other hand, `[]` may indicate that no file should be
+        # generated (possibly files in the disk should be used).
+
+    return itertools.repeat(None)
